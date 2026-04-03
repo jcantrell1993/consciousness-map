@@ -1881,6 +1881,47 @@ input[type="range"]::-moz-range-thumb {
   background: #33ff3330;
 }
 
+/* ═══ MOBILE RESPONSIVE ═══ */
+@media (max-width: 639px) {
+  /* Reduce padding on main containers */
+  .min-h-screen.p-8 { padding: 1rem !important; }
+
+  /* Scale down ASCII logo to fit mobile screens */
+  pre.glow {
+    font-size: 7px !important;
+    line-height: 1.1 !important;
+    letter-spacing: -0.5px;
+  }
+
+  /* Reduce main content padding */
+  .max-w-3xl.mx-auto.px-6 { padding-left: 0.75rem !important; padding-right: 0.75rem !important; }
+
+  /* Make waveform and phase bar text smaller so chars fit */
+  .glow-subtle > div { font-size: 10px !important; letter-spacing: 0px !important; }
+
+  /* Touch-friendly buttons — bigger tap targets */
+  button { min-height: 40px !important; padding: 0.4rem 0.6rem !important; font-size: 13px !important; }
+
+  /* Wider range slider thumb for touch */
+  input[type="range"]::-webkit-slider-thumb { width: 18px !important; height: 28px !important; }
+  input[type="range"]::-moz-range-thumb { width: 18px !important; height: 28px !important; }
+  input[type="range"] { height: 6px !important; }
+
+  /* Tighter gaps in flex-wrap rows */
+  .flex.flex-wrap.gap-x-6 { gap: 0.5rem 0.75rem !important; }
+
+  /* Ensure status line wraps cleanly */
+  .flex.flex-wrap.gap-x-6.gap-y-1 span { font-size: 12px !important; }
+
+  /* Reduce subtitle and quote text */
+  .pulse-text { font-size: 11px !important; letter-spacing: 0.08em !important; }
+}
+
+/* Small phones (under 380px) — extra scaling for ASCII art */
+@media (max-width: 379px) {
+  pre.glow { font-size: 5.5px !important; }
+}
+
 .file\:border-0::file-selector-button {
   border-width: 0;
 }
@@ -13789,6 +13830,7 @@ const BANDS = {
 // Delta (~2Hz) → ~100Hz, Theta (~6Hz) → ~185Hz, Alpha (~10Hz) → ~235Hz
 // Binaural beats are imperceptible above ~30-35Hz; isochronic preferred for gamma
 const BINAURAL_MAX_BEAT = 30;
+const IS_MOBILE = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 function optimalCarrier(beat) {
     const b = getBand(beat);
     return BANDS[b].carrier;
@@ -14161,19 +14203,15 @@ class AudioEngine {
         return buf;
     }
     // ── Rain: real-time multi-layer filtered noise ──
-    // Layer 1: Steady background hiss (highpass-filtered noise — distant rain)
-    // Layer 2: Mid-band patter (bandpass ~1-4kHz — droplets on surfaces)
-    // Layer 3: Low rumble (lowpass ~300Hz — rolling thunder/heavy downpour body)
-    // Layer 4: Droplet impacts via ScriptProcessor (random resonant pings)
-    // All layers use independent noise sources for non-repeating texture
+    // Desktop: 5 layers for rich texture. Mobile: 2 layers to avoid crackling.
     startRain(ctx, dest) {
         const track = (n)=>{
             this.ambNodes.push(n);
             return n;
         };
-        // ── Layer 1: Distant rain hiss ──
+        // ── Layer 1: Steady background hiss (always) ──
         const hissNoise = track(ctx.createBufferSource());
-        hissNoise.buffer = this.makeWhiteNoise(4);
+        hissNoise.buffer = this.makeWhiteNoise(IS_MOBILE ? 2 : 4);
         hissNoise.loop = true;
         const hissHP = track(ctx.createBiquadFilter());
         hissHP.type = "highpass";
@@ -14183,47 +14221,26 @@ class AudioEngine {
         hissLP.type = "lowpass";
         hissLP.frequency.value = 8000;
         const hissGain = track(ctx.createGain());
-        hissGain.gain.value = 0.06;
-        // Slow LFO on hiss volume — rain intensity drifts
+        hissGain.gain.value = IS_MOBILE ? 0.08 : 0.06;
         const hissLfo = track(ctx.createOscillator());
         hissLfo.type = "sine";
-        hissLfo.frequency.value = 0.08; // ~12s cycle
+        hissLfo.frequency.value = 0.08;
         const hissLfoGain = track(ctx.createGain());
         hissLfoGain.gain.value = 0.025;
         hissLfo.connect(hissLfoGain).connect(hissGain.gain);
         hissNoise.connect(hissHP).connect(hissLP).connect(hissGain).connect(dest);
         hissLfo.start();
         hissNoise.start();
-        // ── Layer 2: Mid-frequency droplet patter ──
-        const patNoise = track(ctx.createBufferSource());
-        patNoise.buffer = this.makeWhiteNoise(6);
-        patNoise.loop = true;
-        const patBP = track(ctx.createBiquadFilter());
-        patBP.type = "bandpass";
-        patBP.frequency.value = 2200;
-        patBP.Q.value = 0.8;
-        const patGain = track(ctx.createGain());
-        patGain.gain.value = 0.045;
-        // Faster modulation — gusty variation in droplet density
-        const patLfo = track(ctx.createOscillator());
-        patLfo.type = "sine";
-        patLfo.frequency.value = 0.23;
-        const patLfoG = track(ctx.createGain());
-        patLfoG.gain.value = 0.02;
-        patLfo.connect(patLfoG).connect(patGain.gain);
-        patNoise.connect(patBP).connect(patGain).connect(dest);
-        patLfo.start();
-        patNoise.start();
-        // ── Layer 3: Deep body/rumble ──
+        // ── Layer 2: Low rumble (always — gives body) ──
         const rumNoise = track(ctx.createBufferSource());
-        rumNoise.buffer = this.makeWhiteNoise(5);
+        rumNoise.buffer = this.makeWhiteNoise(IS_MOBILE ? 2 : 5);
         rumNoise.loop = true;
         const rumLP = track(ctx.createBiquadFilter());
         rumLP.type = "lowpass";
         rumLP.frequency.value = 350;
         rumLP.Q.value = 0.7;
         const rumGain = track(ctx.createGain());
-        rumGain.gain.value = 0.09;
+        rumGain.gain.value = IS_MOBILE ? 0.12 : 0.09;
         const rumLfo = track(ctx.createOscillator());
         rumLfo.type = "sine";
         rumLfo.frequency.value = 0.05;
@@ -14233,17 +14250,35 @@ class AudioEngine {
         rumNoise.connect(rumLP).connect(rumGain).connect(dest);
         rumLfo.start();
         rumNoise.start();
-        // ── Layer 4: Sporadic droplet impacts (resonant filtered clicks) ──
-        // Use a looping noise buffer gated by a very spiky random gain pattern
+        // ── Desktop-only layers for richer texture ──
+        if (!IS_MOBILE) {
+        // ── Layer 3: Mid-frequency droplet patter ──
+        const patNoise = track(ctx.createBufferSource());
+        patNoise.buffer = this.makeWhiteNoise(6);
+        patNoise.loop = true;
+        const patBP = track(ctx.createBiquadFilter());
+        patBP.type = "bandpass";
+        patBP.frequency.value = 2200;
+        patBP.Q.value = 0.8;
+        const patGain = track(ctx.createGain());
+        patGain.gain.value = 0.045;
+        const patLfo = track(ctx.createOscillator());
+        patLfo.type = "sine";
+        patLfo.frequency.value = 0.23;
+        const patLfoG = track(ctx.createGain());
+        patLfoG.gain.value = 0.02;
+        patLfo.connect(patLfoG).connect(patGain.gain);
+        patNoise.connect(patBP).connect(patGain).connect(dest);
+        patLfo.start();
+        patNoise.start();
+        // ── Layer 4: Sporadic droplet impacts ──
         const dripNoise = track(ctx.createBufferSource());
         dripNoise.buffer = this.makeWhiteNoise(8);
         dripNoise.loop = true;
-        // Narrow bandpass creates pitched "plink" — like drops hitting a puddle
         const dripBP = track(ctx.createBiquadFilter());
         dripBP.type = "bandpass";
         dripBP.frequency.value = 3800;
         dripBP.Q.value = 12;
-        // Second resonance at different pitch for variety
         const dripBP2 = track(ctx.createBiquadFilter());
         dripBP2.type = "bandpass";
         dripBP2.frequency.value = 2400;
@@ -14252,7 +14287,6 @@ class AudioEngine {
         dripGain.gain.value = 0.03;
         const dripGain2 = track(ctx.createGain());
         dripGain2.gain.value = 0.02;
-        // Gate the drips with a noise-modulated gain to create sporadic hits
         const dripNoise2 = track(ctx.createBufferSource());
         dripNoise2.buffer = this.makeWhiteNoise(3);
         dripNoise2.loop = true;
@@ -14260,7 +14294,7 @@ class AudioEngine {
         dripNoise.connect(dripBP2).connect(dripGain2).connect(dest);
         dripNoise.start();
         dripNoise2.start();
-        // ── Layer 5: Very low sub-bass rumble — distant thunder undertone ──
+        // ── Layer 5: Sub-bass rumble ──
         const subNoise = track(ctx.createBufferSource());
         subNoise.buffer = this.makeWhiteNoise(6);
         subNoise.loop = true;
@@ -14279,35 +14313,31 @@ class AudioEngine {
         subNoise.connect(subLP).connect(subGain).connect(dest);
         subLfo.start();
         subNoise.start();
+        } // end desktop-only rain layers
     }
     // ── Ocean: real-time wave synthesis ──
-    // Core idea: white noise through a lowpass filter whose cutoff is modulated
-    // by slow LFOs — when the filter opens, you hear the "crash"; when it closes,
-    // it recedes to a deep rumble. Multiple wave layers at different speeds create
-    // the overlapping, non-repeating rhythm of a real shoreline.
+    // Desktop: 5 layers for rich shoreline texture. Mobile: 2 layers to avoid crackling.
     startOcean(ctx, dest) {
         const track = (n)=>{
             this.ambNodes.push(n);
             return n;
         };
-        // ── Wave layer A: primary swell (~10s period) ──
+        // ── Wave layer A: primary swell (always) ──
         const noiseA = track(ctx.createBufferSource());
-        noiseA.buffer = this.makeWhiteNoise(8);
+        noiseA.buffer = this.makeWhiteNoise(IS_MOBILE ? 3 : 8);
         noiseA.loop = true;
-        // Dynamic lowpass — LFO sweeps cutoff from 150Hz (trough) to 3500Hz (crest)
         const lpA = track(ctx.createBiquadFilter());
         lpA.type = "lowpass";
         lpA.frequency.value = 800;
         lpA.Q.value = 0.6;
         const lfoA = track(ctx.createOscillator());
         lfoA.type = "sine";
-        lfoA.frequency.value = 0.1; // 10s period
+        lfoA.frequency.value = 0.1;
         const lfoAG = track(ctx.createGain());
-        lfoAG.gain.value = 1600; // sweeps ±1600 around 800 = 800..2400
+        lfoAG.gain.value = 1600;
         lfoA.connect(lfoAG).connect(lpA.frequency);
-        // Volume also swells with the wave
         const gainA = track(ctx.createGain());
-        gainA.gain.value = 0.1;
+        gainA.gain.value = IS_MOBILE ? 0.14 : 0.1;
         const volLfoA = track(ctx.createOscillator());
         volLfoA.type = "sine";
         volLfoA.frequency.value = 0.1;
@@ -14318,9 +14348,9 @@ class AudioEngine {
         lfoA.start();
         volLfoA.start();
         noiseA.start();
-        // ── Wave layer B: secondary swell (~7s, offset phase) ──
+        // ── Wave layer B: secondary swell (always — gives wave overlap) ──
         const noiseB = track(ctx.createBufferSource());
-        noiseB.buffer = this.makeWhiteNoise(6);
+        noiseB.buffer = this.makeWhiteNoise(IS_MOBILE ? 3 : 6);
         noiseB.loop = true;
         const lpB = track(ctx.createBiquadFilter());
         lpB.type = "lowpass";
@@ -14328,12 +14358,12 @@ class AudioEngine {
         lpB.Q.value = 0.5;
         const lfoB = track(ctx.createOscillator());
         lfoB.type = "sine";
-        lfoB.frequency.value = 0.143; // ~7s
+        lfoB.frequency.value = 0.143;
         const lfoBG = track(ctx.createGain());
         lfoBG.gain.value = 1200;
         lfoB.connect(lfoBG).connect(lpB.frequency);
         const gainB = track(ctx.createGain());
-        gainB.gain.value = 0.07;
+        gainB.gain.value = IS_MOBILE ? 0.1 : 0.07;
         const volLfoB = track(ctx.createOscillator());
         volLfoB.type = "sine";
         volLfoB.frequency.value = 0.143;
@@ -14344,7 +14374,9 @@ class AudioEngine {
         lfoB.start();
         volLfoB.start();
         noiseB.start();
-        // ── Wave layer C: slow deep swell (~16s) for long-period variation ──
+        // ── Desktop-only layers for richer texture ──
+        if (!IS_MOBILE) {
+        // ── Wave layer C: slow deep swell (~16s) ──
         const noiseC = track(ctx.createBufferSource());
         noiseC.buffer = this.makeWhiteNoise(10);
         noiseC.loop = true;
@@ -14363,7 +14395,7 @@ class AudioEngine {
         noiseC.connect(lpC).connect(gainC).connect(dest);
         lfoC.start();
         noiseC.start();
-        // ── Surf foam: highpassed noise, constant but quiet — the hiss between waves ──
+        // ── Surf foam ──
         const foamNoise = track(ctx.createBufferSource());
         foamNoise.buffer = this.makeWhiteNoise(5);
         foamNoise.loop = true;
@@ -14375,7 +14407,6 @@ class AudioEngine {
         foamLP.frequency.value = 9000;
         const foamGain = track(ctx.createGain());
         foamGain.gain.value = 0.015;
-        // Foam gets louder when waves crest
         const foamLfo = track(ctx.createOscillator());
         foamLfo.type = "sine";
         foamLfo.frequency.value = 0.1;
@@ -14385,7 +14416,7 @@ class AudioEngine {
         foamNoise.connect(foamHP).connect(foamLP).connect(foamGain).connect(dest);
         foamLfo.start();
         foamNoise.start();
-        // ── Deep undertow: very low sub-bass presence ──
+        // ── Deep undertow ──
         const subNoise = track(ctx.createBufferSource());
         subNoise.buffer = this.makeWhiteNoise(8);
         subNoise.loop = true;
@@ -14404,6 +14435,7 @@ class AudioEngine {
         subNoise.connect(subLP).connect(subGain).connect(dest);
         subLfo.start();
         subNoise.start();
+        } // end desktop-only ocean layers
     }
     startAmbient() {
         this.stopAmbient();
@@ -14854,7 +14886,7 @@ function BootSequence({ onComplete }) {
 function PhaseBar({ preset, phaseIdx, elapsed }) {
     const totalSec = preset.phases.reduce((s, p)=>s + p.minutes * 60, 0);
     let accumulated = 0;
-    const barWidth = 48;
+    const barWidth = IS_MOBILE ? Math.min(30, Math.floor((window.innerWidth - 60) / 9)) : 48;
     return /*#__PURE__*/ (0, _jsxRuntime.jsx)("div", {
         style: {
             fontFamily: "inherit"
@@ -15228,7 +15260,7 @@ function Terminal() {
                             /*#__PURE__*/ (0, _jsxRuntime.jsx)(AsciiWaveform, {
                                 beat: beat,
                                 playing: playing,
-                                width: 58
+                                width: IS_MOBILE ? Math.min(38, Math.floor((window.innerWidth - 40) / 9)) : 58
                             })
                         ]
                     }),
