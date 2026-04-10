@@ -14117,10 +14117,25 @@ class AudioEngine {
         this.playing = true;
         this.master = ctx.createGain();
         this.master.gain.value = vol;
+        // Dry path: master → destination
         this.master.connect(ctx.destination);
+        // Reverb send/return (desktop only): master → reverbSend → convolver → reverbReturn → destination
+        if (!IS_MOBILE) {
+            this.convolver = ctx.createConvolver();
+            this.convolver.buffer = this.makeImpulseResponse();
+            this.reverbSend = ctx.createGain();
+            this.reverbSend.gain.value = 0.18;
+            this.reverbReturn = ctx.createGain();
+            this.reverbReturn.gain.value = 0.75;
+            this.master.connect(this.reverbSend);
+            this.reverbSend.connect(this.convolver);
+            this.convolver.connect(this.reverbReturn);
+            this.reverbReturn.connect(ctx.destination);
+        }
         if (mode === "binaural" || mode === "both") this.startBinaural(ctx, carrier, beat, mode === "both" ? 0.6 : 1);
         if (mode === "isochronic" || mode === "both") this.startIso(ctx, carrier, beat, mode === "both" ? 0.4 : 1);
         this.startAmbient();
+        this.startSpatialSweep(ctx);
     }
     startBinaural(ctx, c, b, mix) {
         // Clamp binaural beat to perceptible range (Oster: ~30Hz max)
@@ -14201,6 +14216,111 @@ class AudioEngine {
             }
         }
         return buf;
+    }
+    // ── Synthetic reverb impulse response (decaying noise burst) ──
+    makeImpulseResponse(duration = 2.8, decay = 3.2) {
+        const ctx = this.ctx;
+        const sr = ctx.sampleRate;
+        const len = Math.floor(sr * duration);
+        const buf = ctx.createBuffer(2, len, sr);
+        for (let ch = 0; ch < 2; ch++) {
+            const d = buf.getChannelData(ch);
+            const predelay = Math.floor(sr * 0.003);
+            for (let i = 0; i < predelay; i++) d[i] = 0;
+            for (let i = predelay; i < len; i++) {
+                const t = (i - predelay) / (len - predelay);
+                d[i] = (Math.random() * 2 - 1) * Math.pow(1 - t, decay);
+            }
+        }
+        return buf;
+    }
+    // ── Orbiting spatial sweep — pink noise source circling the listener ──
+    startSpatialSweep(ctx) {
+        if (IS_MOBILE) return;
+        this.sweepPanner = ctx.createPanner();
+        this.sweepPanner.panningModel = "HRTF";
+        this.sweepPanner.distanceModel = "inverse";
+        this.sweepPanner.refDistance = 1;
+        this.sweepPanner.maxDistance = 100;
+        this.sweepPanner.rolloffFactor = 1;
+        this.sweepPanner.coneInnerAngle = 360;
+        this.sweepPanner.connect(ctx.destination);
+        // Pink noise source for the orbiting presence
+        const sr = ctx.sampleRate;
+        const nlen = sr * 4;
+        const nbuf = ctx.createBuffer(1, nlen, sr);
+        const nd = nbuf.getChannelData(0);
+        let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
+        for (let i = 0; i < nlen; i++) {
+            const w = Math.random() * 2 - 1;
+            b0 = 0.99886 * b0 + w * 0.0555179; b1 = 0.99332 * b1 + w * 0.0750759;
+            b2 = 0.969 * b2 + w * 0.153852;    b3 = 0.8665 * b3 + w * 0.3104856;
+            b4 = 0.55 * b4 + w * 0.5329522;    b5 = -0.7616 * b5 - w * 0.016898;
+            nd[i] = (b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362) * 0.04;
+            b6 = w * 0.115926;
+        }
+        this.sweepOsc = ctx.createBufferSource();
+        this.sweepOsc.buffer = nbuf;
+        this.sweepOsc.loop = true;
+        // Low-pass so the sweep sounds like a presence, not raw noise
+        const lpf = ctx.createBiquadFilter();
+        lpf.type = "lowpass";
+        lpf.frequency.value = 350;
+        this.sweepGain = ctx.createGain();
+        this.sweepGain.gain.value = 0.038;
+        this.sweepOsc.connect(lpf);
+        lpf.connect(this.sweepGain);
+        this.sweepGain.connect(this.sweepPanner);
+        this.sweepOsc.start();
+        // Animate orbit — ~27s per revolution at 60fps
+        const step = 0.007;
+        const radius = 3;
+        const animate = ()=>{
+            if (!this.sweepPanner) return;
+            this.sweepAngle = (this.sweepAngle + step) % (Math.PI * 2);
+            this.sweepPanner.positionX.value = Math.cos(this.sweepAngle) * radius;
+            this.sweepPanner.positionY.value = 0.5;
+            this.sweepPanner.positionZ.value = Math.sin(this.sweepAngle) * radius;
+            this.sweepAnimId = requestAnimationFrame(animate);
+        };
+        this.sweepAnimId = requestAnimationFrame(animate);
+    }
+    stopSpatialSweep() {
+        if (this.sweepAnimId) {
+            cancelAnimationFrame(this.sweepAnimId);
+            this.sweepAnimId = null;
+        }
+        try { this.sweepOsc?.stop(); } catch  {}
+        this.sweepOsc?.disconnect();
+        this.sweepPanner?.disconnect();
+        this.sweepGain?.disconnect();
+        this.sweepOsc = null;
+        this.sweepPanner = null;
+        this.sweepGain = null;
+    }
+    // ── Route ambGain into master, optionally through HRTF panner ──
+    _connectAmbGain(ambGain, type) {
+        if (!IS_MOBILE && (type === "rain" || type === "ocean")) {
+            this.ambPanner = this.ctx.createPanner();
+            this.ambPanner.panningModel = "HRTF";
+            this.ambPanner.distanceModel = "inverse";
+            this.ambPanner.refDistance = 1;
+            if (type === "rain") {
+                // Rain falls from above
+                this.ambPanner.positionX.value = 0;
+                this.ambPanner.positionY.value = 3;
+                this.ambPanner.positionZ.value = 0;
+            } else {
+                // Ocean is in front, slightly below
+                this.ambPanner.positionX.value = 0;
+                this.ambPanner.positionY.value = -0.5;
+                this.ambPanner.positionZ.value = -4;
+            }
+            ambGain.connect(this.ambPanner);
+            this.ambPanner.connect(this.master);
+        } else {
+            ambGain.connect(this.master);
+        }
     }
     // ── Rain: real-time multi-layer filtered noise ──
     // Desktop: 5 layers for rich texture. Mobile: 2 layers to avoid crackling.
@@ -14445,7 +14565,7 @@ class AudioEngine {
             // Try to use real recorded audio; fall back to synthesis
             this.ambGain = ctx.createGain();
             this.ambGain.gain.value = 0;
-            this.ambGain.connect(this.master);
+            this._connectAmbGain(this.ambGain, this._ambType);
             const key = this._ambType;
             const cached = this.audioCache[key];
             if (cached) {
@@ -14469,7 +14589,7 @@ class AudioEngine {
                     if (!this.ctx || !this.master) return;
                     this.ambGain = this.ctx.createGain();
                     this.ambGain.gain.value = 0.35;
-                    this.ambGain.connect(this.master);
+                    this._connectAmbGain(this.ambGain, key);
                     this.ambNode = this.ctx.createBufferSource();
                     this.ambNode.buffer = buf;
                     this.ambNode.loop = true;
@@ -14481,7 +14601,7 @@ class AudioEngine {
             const buf = this.genNoise(this._ambType);
             this.ambGain = ctx.createGain();
             this.ambGain.gain.value = 0.15;
-            this.ambGain.connect(this.master);
+            this._connectAmbGain(this.ambGain, this._ambType);
             this.ambNode = ctx.createBufferSource();
             this.ambNode.buffer = buf;
             this.ambNode.loop = true;
@@ -14508,6 +14628,8 @@ class AudioEngine {
         this.ambNodes = [];
         this.ambGain?.disconnect();
         this.ambGain = null;
+        this.ambPanner?.disconnect();
+        this.ambPanner = null;
     }
     setAmbient(t) {
         this._ambType = t;
@@ -14536,6 +14658,7 @@ class AudioEngine {
             } catch  {}
         });
         this.stopAmbient();
+        this.stopSpatialSweep();
         this.oscL = null;
         this.oscR = null;
         this.gainL = null;
@@ -14545,6 +14668,12 @@ class AudioEngine {
         this.isoGain = null;
         this.isoLfo = null;
         this.isoLfoGain = null;
+        this.convolver?.disconnect();
+        this.reverbSend?.disconnect();
+        this.reverbReturn?.disconnect();
+        this.convolver = null;
+        this.reverbSend = null;
+        this.reverbReturn = null;
         this.master?.disconnect();
         this.master = null;
     }
@@ -14567,7 +14696,188 @@ class AudioEngine {
         this.audioCache = {};
         this.loadingAudio = {};
         this.playing = false;
+        // 3D spatial audio
+        this.convolver = null;
+        this.reverbSend = null;
+        this.reverbReturn = null;
+        this.ambPanner = null;
+        this.sweepPanner = null;
+        this.sweepOsc = null;
+        this.sweepGain = null;
+        this.sweepAnimId = null;
+        this.sweepAngle = 0;
     }
+}
+/* ═══════════════════════════════════════════════════════════
+   PARTICLE FIELD VISUALIZER
+   Looking down on a pool of particles that respond to audio.
+   ═══════════════════════════════════════════════════════════ */
+// Pre-built alpha LUT for fast fillStyle — avoids string concatenation per particle
+const PARTICLE_ALPHA_LUT = (()=>{
+    const lut = new Array(256);
+    for (let i = 0; i < 256; i++) {
+        const h = i < 16 ? "0" + i.toString(16) : i.toString(16);
+        lut[i] = "#33ff33" + h;
+    }
+    return lut;
+})();
+
+function ParticleVisualizer({ beat, carrier, volume, playing, mode, ambient, engine }) {
+    const canvasRef = (0, _react.useRef)(null);
+    const fieldRef  = (0, _react.useRef)(null);
+    const animRef   = (0, _react.useRef)(null);
+
+    // Build particle field + per-particle density map.  Fixed for the life of the component.
+    (0, _react.useEffect)(()=>{
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const W = canvas.width, H = canvas.height;
+        const N = IS_MOBILE ? 3800 : 9500;
+        const bx    = new Float32Array(N);
+        const by    = new Float32Array(N);
+        const ph    = new Float32Array(N);      // per-particle phase jitter
+        const waveK = new Float32Array(N);      // wavenumber — density-modulated wave speed
+        const density = new Float32Array(N);    // noise value for tuning/reference
+        const respRate = new Float32Array(N);   // per-particle ripple response multiplier
+        const sizeArr  = new Uint8Array(N);     // 1 or 2 — some particles render 2x2 for texture
+
+        // Density field — five octaves of sinusoidal noise for rich organic variation
+        for (let i = 0; i < N; i++) {
+            const x = Math.random() * W;
+            const y = Math.random() * H;
+            bx[i] = x;
+            by[i] = y;
+            ph[i] = Math.random() * Math.PI * 2;
+
+            // Density — 5 octaves → range roughly [-1.2, 1.2]
+            const d = Math.sin(x * 0.011 + y * 0.008 + 0.4) * 0.42
+                    + Math.sin(x * 0.006 - y * 0.017 + 1.7) * 0.32
+                    + Math.cos(x * 0.021 + y * 0.013 + 2.3) * 0.24
+                    + Math.sin(x * 0.033 + y * 0.026 + 3.1) * 0.16
+                    + Math.cos(x * 0.051 - y * 0.039 + 4.7) * 0.11;
+            density[i] = d;
+            // waveK: base 0.026 (wavelength ~242 px), wider variation for dramatic warping
+            waveK[i] = 0.026 + d * 0.020;
+            // Per-particle response rate — some dots flare brighter, some barely react
+            respRate[i] = 0.55 + Math.random() * 0.9;   // [0.55, 1.45]
+            // ~18% of dots render as 2x2 for extra texture/variation
+            sizeArr[i] = Math.random() < 0.18 ? 2 : 1;
+        }
+        fieldRef.current = { bx, by, ph, waveK, density, respRate, sizeArr, N };
+    }, []);
+
+    // Render loop — wave pool: generator at center, waves radiate outward at density-varying speeds
+    (0, _react.useEffect)(()=>{
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext("2d");
+        const W = canvas.width, H = canvas.height;
+        const cx = W / 2, cy = H / 2;
+
+        const draw = ()=>{
+            animRef.current = requestAnimationFrame(draw);
+            const field = fieldRef.current;
+            if (!field) return;
+            const { bx, by, ph, waveK, density, respRate, sizeArr, N } = field;
+
+            // Hard clear — static does not linger
+            ctx.fillStyle = "#000";
+            ctx.fillRect(0, 0, W, H);
+
+            const t   = performance.now() / 1000;
+            const vol = playing ? volume / 100 : 0;
+
+            // ── Emission rate — MUCH slower than before ──
+            // Loosely tied to beat Hz, but clamped so even fast beats give lazy ripples.
+            // At beat=1.5Hz → 0.45, at beat=4 → 1.0, at beat=10 → 1.8 (clamped at 2.0)
+            const emissionHz = playing
+                ? Math.max(0.35, Math.min(2.0, beat * 0.22))
+                : 0.30;
+            const omega = emissionHz * Math.PI * 2;
+
+            // Carrier shimmer — also slow
+            const carrOmega = Math.max(0.6, Math.min(3.5, carrier * 0.014));
+
+            // Slow "breath" envelope that modulates the whole field — adds variation over time
+            const breath = 0.7 + 0.3 * Math.sin(t * 0.18);
+
+            // Ambient modifiers
+            const oceanSwell = (ambient === "ocean")
+                ? Math.sin(t * 0.19) * 0.38
+                : 0;
+            const rainActive = (ambient === "rain");
+
+            // Static baseline
+            const staticBase = playing ? 0.14 : 0.10;
+            // Ripple strength — visible at any volume
+            const rippleStr = playing ? (0.55 + vol * 0.55) * breath : 0.15;
+
+            for (let i = 0; i < N; i++) {
+                const x  = bx[i], y = by[i];
+                const dx = x - cx, dy = y - cy;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                const invDist = dist > 0.5 ? 1 / dist : 0;
+                const k_i = waveK[i];
+                const resp = respRate[i];
+
+                // ── Primary ripple: sharp pulse radiating from center ──
+                // omega is slow → ripples crawl outward.
+                // k_i varies by density → wavefront distorts organically.
+                const phase1 = dist * k_i - t * omega + ph[i] * 0.35;
+                const s1 = Math.sin(phase1);
+                const s1p = s1 > 0 ? s1 : 0;
+                const ripple = s1p * s1p * s1p;               // narrow sharp pulse
+
+                // ── Carrier shimmer: finer secondary ripple, also slow ──
+                const phase2 = dist * k_i * 1.7 - t * carrOmega + ph[i];
+                const s2 = Math.sin(phase2);
+                const s2p = s2 > 0 ? s2 : 0;
+                const carrierRipple = s2p * s2p * 0.28;
+
+                // ── Idle shimmer: independent per-particle breathing ──
+                const idle = (Math.sin(t * 0.85 + ph[i] * 4.1) * 0.5 + 0.5) * 0.18;
+
+                // Ambient contributions
+                const ambBoost =
+                      oceanSwell * ((y / H) - 0.5) * 0.5
+                    + (rainActive && Math.random() < 0.0020 ? 0.55 : 0);
+
+                // ── Compose alpha ──
+                let alpha = staticBase
+                          + ripple * rippleStr * resp * 1.5
+                          + carrierRipple * (vol * 0.6 + 0.1)
+                          + idle * vol * 0.4
+                          + ambBoost * vol;
+
+                if (alpha > 1) alpha = 1;
+                if (alpha < 0.02) continue;  // skip near-invisible dots — major perf win
+
+                // Radial displacement: particles surf on the passing wave front
+                const push = ripple * rippleStr * resp * 4;
+                const ox = dx * invDist * push;
+                const oy = dy * invDist * push;
+
+                const a255 = (alpha * 255) | 0;
+                ctx.fillStyle = PARTICLE_ALPHA_LUT[a255];
+                const sz = sizeArr[i];
+                ctx.fillRect((x + ox) | 0, (y + oy) | 0, sz, sz);
+            }
+        };
+
+        draw();
+        return ()=>cancelAnimationFrame(animRef.current);
+    }, [beat, carrier, volume, playing, mode, ambient]);
+
+    return (0, _jsxRuntime.jsx)("canvas", {
+        ref: canvasRef,
+        width: IS_MOBILE ? 360 : 680,
+        height: IS_MOBILE ? 200 : 340,
+        style: {
+            width: "100%",
+            display: "block",
+            borderRadius: "1px",
+        }
+    });
 }
 /* ═══════════════════════════════════════════════════════════
    CRT COMPONENTS
@@ -15261,6 +15571,28 @@ function Terminal() {
                                 beat: beat,
                                 playing: playing,
                                 width: IS_MOBILE ? Math.min(38, Math.floor((window.innerWidth - 40) / 9)) : 58
+                            })
+                        ]
+                    }),
+                    /*#__PURE__*/ (0, _jsxRuntime.jsxs)("div", {
+                        className: "mb-3",
+                        children: [
+                            /*#__PURE__*/ (0, _jsxRuntime.jsx)("div", {
+                                style: {
+                                    color: "#33ff3340",
+                                    fontSize: "12px",
+                                    marginBottom: "4px"
+                                },
+                                children: "\u2500\u2500 FIELD VISUALIZER \u2500\u2500"
+                            }),
+                            /*#__PURE__*/ (0, _jsxRuntime.jsx)(ParticleVisualizer, {
+                                beat: beat,
+                                carrier: carrier,
+                                volume: volume,
+                                playing: playing,
+                                mode: mode,
+                                ambient: ambient,
+                                engine: eng
                             })
                         ]
                     }),
