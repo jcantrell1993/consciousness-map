@@ -14136,6 +14136,7 @@ class AudioEngine {
         if (mode === "isochronic" || mode === "both") this.startIso(ctx, carrier, beat, mode === "both" ? 0.4 : 1);
         this.startAmbient();
         this.startSpatialSweep(ctx);
+        if (this.omEnabled) this.startOm();
     }
     startBinaural(ctx, c, b, mix) {
         // Clamp binaural beat to perceptible range (Oster: ~30Hz max)
@@ -14297,6 +14298,125 @@ class AudioEngine {
         this.sweepOsc = null;
         this.sweepPanner = null;
         this.sweepGain = null;
+    }
+    // ── Tibetan OM choral drone — independent ambient layer ──
+    // Two slightly-detuned voices, each a stack of 6 harmonics (f, 2f..6f)
+    // passed through a low-pass "formant" filter whose cutoff is swept by an
+    // LFO (gives the "aaauuu → mmmm" vowel morph). A second LFO drives a
+    // breath-paced amplitude envelope. Sends to reverb for temple space.
+    startOm() {
+        if (!this.ctx || !this.master) return;
+        this._teardownOm();
+        const ctx = this.ctx;
+        const now = ctx.currentTime;
+        const track = (n) => { this.omNodes.push(n); return n; };
+
+        // Master OM bus → main master + reverb send (desktop)
+        this.omGain = ctx.createGain();
+        this.omGain.gain.value = 0;
+        this.omGain.connect(this.master);
+        if (this.reverbSend) this.omGain.connect(this.reverbSend);
+        // Slow fade in
+        this.omGain.gain.linearRampToValueAtTime(0.30, now + 2.5);
+
+        const fundamental = 108;                              // traditional deep OM (~A2)
+        const harmonicAmps = [1.0, 0.55, 0.38, 0.24, 0.16, 0.10];
+        // Three-voice choir. Detunes spread ~14 cents total for shimmer
+        // without going out of tune. Breath offsets span ~120° of the
+        // ~8.3s breath cycle so at least one voice is always audible.
+        const voices = [
+            { detune:  -7, breathOffset: 0,    formantOffset: 0   },
+            { detune:   0, breathOffset: 2.8,  formantOffset: 1.6 },
+            { detune:  +7, breathOffset: 5.6,  formantOffset: 3.3 },
+        ];
+
+        for (let vi = 0; vi < voices.length; vi++) {
+            const v = voices[vi];
+
+            // Formant low-pass (vowel colour)
+            const voiceLP = track(ctx.createBiquadFilter());
+            voiceLP.type = "lowpass";
+            voiceLP.frequency.value = 850;
+            voiceLP.Q.value = 1.6;
+
+            // Voice mix gain — LFO-modulated for breath envelope
+            const voiceMix = track(ctx.createGain());
+            voiceMix.gain.value = 0.05;                       // baseline before LFO sums in
+
+            // Breath LFO → voiceMix.gain  (sine around 0.5 ± 0.45, ~8s cycle)
+            const breathLfo = track(ctx.createOscillator());
+            breathLfo.type = "sine";
+            breathLfo.frequency.value = 0.12;                 // ~8.3s period
+            const breathAmp = track(ctx.createGain());
+            breathAmp.gain.value = 0.45;
+            breathLfo.connect(breathAmp).connect(voiceMix.gain);
+            breathLfo.start(now + v.breathOffset);
+
+            // Formant LFO → filter cutoff (slow vowel sweep, ±350 Hz)
+            const formLfo = track(ctx.createOscillator());
+            formLfo.type = "sine";
+            formLfo.frequency.value = 0.075;
+            const formAmp = track(ctx.createGain());
+            formAmp.gain.value = 350;
+            formLfo.connect(formAmp).connect(voiceLP.frequency);
+            formLfo.start(now + v.formantOffset);
+
+            // Harmonic stack
+            for (let h = 0; h < harmonicAmps.length; h++) {
+                const osc = track(ctx.createOscillator());
+                osc.type = "sine";
+                osc.frequency.value = fundamental * (h + 1);
+                osc.detune.value = v.detune + (h * 2);        // gentle harmonic spread
+                const hGain = track(ctx.createGain());
+                hGain.gain.value = harmonicAmps[h] * 0.32;    // scale pre-filter (3 voices)
+                osc.connect(hGain).connect(voiceLP);
+                osc.start();
+            }
+
+            voiceLP.connect(voiceMix).connect(this.omGain);
+        }
+    }
+    // Graceful fade-out for user-initiated OM toggle
+    _fadeOutOm() {
+        if (!this.omGain || !this.ctx) return;
+        const now = this.ctx.currentTime;
+        const gain = this.omGain;
+        const nodes = this.omNodes;
+        try {
+            gain.gain.cancelScheduledValues(now);
+            gain.gain.setValueAtTime(gain.gain.value, now);
+            gain.gain.linearRampToValueAtTime(0, now + 0.9);
+        } catch {}
+        this.omGain = null;
+        this.omNodes = [];
+        setTimeout(() => {
+            for (let i = 0; i < nodes.length; i++) {
+                const n = nodes[i];
+                try { if (n.stop) n.stop(); } catch {}
+                try { n.disconnect(); } catch {}
+            }
+            try { gain.disconnect(); } catch {}
+        }, 1100);
+    }
+    // Synchronous teardown for engine stop
+    _teardownOm() {
+        for (let i = 0; i < this.omNodes.length; i++) {
+            const n = this.omNodes[i];
+            try { if (n.stop) n.stop(); } catch {}
+            try { n.disconnect(); } catch {}
+        }
+        this.omNodes = [];
+        try { this.omGain?.disconnect(); } catch {}
+        this.omGain = null;
+    }
+    setOm(on) {
+        this.omEnabled = !!on;
+        if (!this.playing) return;
+        if (on) {
+            if (!this.omGain) this.startOm();
+        } else {
+            this._fadeOutOm();
+        }
     }
     // ── Route ambGain into master, optionally through HRTF panner ──
     _connectAmbGain(ambGain, type) {
@@ -14659,6 +14779,7 @@ class AudioEngine {
         });
         this.stopAmbient();
         this.stopSpatialSweep();
+        this._teardownOm();
         this.oscL = null;
         this.oscR = null;
         this.gainL = null;
@@ -14706,6 +14827,10 @@ class AudioEngine {
         this.sweepGain = null;
         this.sweepAnimId = null;
         this.sweepAngle = 0;
+        // Tibetan OM drone (independent layer)
+        this.omEnabled = false;
+        this.omGain = null;
+        this.omNodes = [];
     }
 }
 /* ═══════════════════════════════════════════════════════════
@@ -14801,11 +14926,36 @@ function ParticleVisualizer({ beat, carrier, volume, playing, mode, ambient, eng
             // Slow "breath" envelope that modulates the whole field — adds variation over time
             const breath = 0.7 + 0.3 * Math.sin(t * 0.18);
 
-            // Ambient modifiers
-            const oceanSwell = (ambient === "ocean")
-                ? Math.sin(t * 0.19) * 0.38
-                : 0;
-            const rainActive = (ambient === "rain");
+            // Ambient flags & pre-computed modifiers
+            const isPink = ambient === "pink";
+            const isBrown = ambient === "brown";
+            const isOcean = ambient === "ocean";
+            const isoMulti = (mode === "isochronic" || mode === "both");
+
+            // Brown — slow global deep pulse
+            const brownPulse = isBrown
+                ? 0.7 + 0.3 * Math.sin(t * 0.22)
+                : 1;
+
+            // Extra wave sources for isochronic — creates interference/collision patterns
+            // Four drifting sources at interior positions; their ripples collide with the center wave
+            const isoS0x = W * (0.22 + 0.03 * Math.sin(t * 0.11));
+            const isoS0y = H * (0.28 + 0.04 * Math.cos(t * 0.13));
+            const isoS1x = W * (0.78 + 0.03 * Math.cos(t * 0.09));
+            const isoS1y = H * (0.32 + 0.04 * Math.sin(t * 0.15));
+            const isoS2x = W * (0.28 + 0.04 * Math.sin(t * 0.14));
+            const isoS2y = H * (0.76 + 0.03 * Math.cos(t * 0.10));
+            const isoS3x = W * (0.74 + 0.04 * Math.cos(t * 0.12));
+            const isoS3y = H * (0.72 + 0.03 * Math.sin(t * 0.16));
+
+            // Ocean wave sources — origin drifts just outside the bottom-left
+            // corner so the wave radiates diagonally across the field. A second
+            // slower "chop" source nearby creates cross-hatching for wild texture.
+            const oceanOx    = W * (-0.05 + 0.04 * Math.sin(t * 0.18));
+            const oceanOy    = H * ( 1.05 + 0.03 * Math.cos(t * 0.14));
+            const oceanCxS   = W * ( 0.12 + 0.05 * Math.cos(t * 0.21));
+            const oceanCyS   = H * ( 0.92 + 0.04 * Math.sin(t * 0.17));
+            const oceanOmega = omega * 0.55;
 
             // Static baseline
             const staticBase = playing ? 0.14 : 0.10;
@@ -14826,7 +14976,60 @@ function ParticleVisualizer({ beat, carrier, volume, playing, mode, ambient, eng
                 const phase1 = dist * k_i - t * omega + ph[i] * 0.35;
                 const s1 = Math.sin(phase1);
                 const s1p = s1 > 0 ? s1 : 0;
-                const ripple = s1p * s1p * s1p;               // narrow sharp pulse
+                let ripple = s1p * s1p * s1p;               // narrow sharp pulse
+
+                // ── Isochronic multi-source interference ──
+                // Extra wavefronts from four drifting sources collide with the center wave
+                if (isoMulti) {
+                    const dx0 = x - isoS0x, dy0 = y - isoS0y;
+                    const d0 = Math.sqrt(dx0 * dx0 + dy0 * dy0);
+                    const dx1 = x - isoS1x, dy1 = y - isoS1y;
+                    const d1 = Math.sqrt(dx1 * dx1 + dy1 * dy1);
+                    const dx2 = x - isoS2x, dy2 = y - isoS2y;
+                    const d2 = Math.sqrt(dx2 * dx2 + dy2 * dy2);
+                    const dx3 = x - isoS3x, dy3 = y - isoS3y;
+                    const d3 = Math.sqrt(dx3 * dx3 + dy3 * dy3);
+                    const p0 = Math.sin(d0 * k_i - t * omega * 1.1 + 0.7);
+                    const p1 = Math.sin(d1 * k_i - t * omega * 0.9 + 1.9);
+                    const p2 = Math.sin(d2 * k_i - t * omega * 1.05 + 2.8);
+                    const p3 = Math.sin(d3 * k_i - t * omega * 0.95 + 4.1);
+                    const pp0 = p0 > 0 ? p0 : 0;
+                    const pp1 = p1 > 0 ? p1 : 0;
+                    const pp2 = p2 > 0 ? p2 : 0;
+                    const pp3 = p3 > 0 ? p3 : 0;
+                    // Sharpen each and add — collisions create bright interference nodes
+                    const extra = pp0*pp0*pp0 + pp1*pp1*pp1 + pp2*pp2*pp2 + pp3*pp3*pp3;
+                    ripple = (ripple + extra) * 0.62;        // rebalance — avoid oversaturation
+                }
+
+                // ── Ocean wave: organic swell emanating from bottom-left corner ──
+                // Three layered sinusoids (swell + chop + cross-chop) give a
+                // broken, wild surface. Kept signed (not cubed) so particles
+                // surf bidirectionally along the propagation direction, and
+                // the brightness contribution is squared so both crest and
+                // trough light up — interfering naturally with the center
+                // ripple and isochronic multi-sources above.
+                let oceanBright = 0;
+                let oceanDirX = 0, oceanDirY = 0;
+                let oceanSigned = 0;
+                if (isOcean) {
+                    const dxO = x - oceanOx, dyO = y - oceanOy;
+                    const dO  = Math.sqrt(dxO * dxO + dyO * dyO);
+                    const dxC = x - oceanCxS, dyC = y - oceanCyS;
+                    const dC  = Math.sqrt(dxC * dxC + dyC * dyC);
+                    // Main swell — long wavelength, slow omega
+                    const swell = Math.sin(dO * k_i * 0.55 - t * oceanOmega + ph[i] * 0.15);
+                    // Surface chop — shorter wavelength, faster
+                    const chop  = Math.sin(dC * k_i * 1.15 - t * oceanOmega * 1.75 + ph[i] * 0.45);
+                    // Cross-chop — planar diagonal front breaks up radial symmetry
+                    const crossPhase = (x * 0.008 + (H - y) * 0.011) - t * oceanOmega * 1.2;
+                    const cross = Math.sin(crossPhase + ph[i] * 0.25);
+                    oceanSigned = swell * 0.75 + chop * 0.45 + cross * 0.3;
+                    oceanBright = oceanSigned * oceanSigned * 0.85;
+                    const invDO = dO > 0.5 ? 1 / dO : 0;
+                    oceanDirX = dxO * invDO;
+                    oceanDirY = dyO * invDO;
+                }
 
                 // ── Carrier shimmer: finer secondary ripple, also slow ──
                 const phase2 = dist * k_i * 1.7 - t * carrOmega + ph[i];
@@ -14837,14 +15040,21 @@ function ParticleVisualizer({ beat, carrier, volume, playing, mode, ambient, eng
                 // ── Idle shimmer: independent per-particle breathing ──
                 const idle = (Math.sin(t * 0.85 + ph[i] * 4.1) * 0.5 + 0.5) * 0.18;
 
-                // Ambient contributions
-                const ambBoost =
-                      oceanSwell * ((y / H) - 0.5) * 0.5
-                    + (rainActive && Math.random() < 0.0020 ? 0.55 : 0);
+                // Ambient particle-level contributions
+                // Pink: fine even hiss — random per-frame sparkle boost (noisy but calm)
+                const pinkBoost = isPink
+                    ? (Math.random() < 0.09 ? 0.18 : 0) + 0.05 * Math.sin(t * 1.6 + ph[i] * 3.3)
+                    : 0;
+                // Brown: slow deep breath — all particles rise/fall together
+                const brownBoost = isBrown
+                    ? (brownPulse - 1) * 0.55 + 0.06 * Math.sin(dist * 0.005 - t * 0.4)
+                    : 0;
+                const ambBoost = pinkBoost + brownBoost;
 
                 // ── Compose alpha ──
                 let alpha = staticBase
                           + ripple * rippleStr * resp * 1.5
+                          + oceanBright * rippleStr * resp * 1.35
                           + carrierRipple * (vol * 0.6 + 0.1)
                           + idle * vol * 0.4
                           + ambBoost * vol;
@@ -14854,13 +15064,121 @@ function ParticleVisualizer({ beat, carrier, volume, playing, mode, ambient, eng
 
                 // Radial displacement: particles surf on the passing wave front
                 const push = ripple * rippleStr * resp * 4;
-                const ox = dx * invDist * push;
-                const oy = dy * invDist * push;
+                let ox = dx * invDist * push;
+                let oy = dy * invDist * push;
+
+                // Ocean displacement: particles surge along the diagonal
+                // propagation direction, creating cross-motion that interferes
+                // with the radial pushes above — this is what makes it look wild.
+                if (isOcean) {
+                    const oceanPush = oceanSigned * rippleStr * resp * 3.2;
+                    ox += oceanDirX * oceanPush;
+                    oy += oceanDirY * oceanPush;
+                }
 
                 const a255 = (alpha * 255) | 0;
                 ctx.fillStyle = PARTICLE_ALPHA_LUT[a255];
                 const sz = sizeArr[i];
                 ctx.fillRect((x + ox) | 0, (y + oy) | 0, sz, sz);
+            }
+
+            // ── Monochrome green ambient overlays — stay inline with CRT aesthetic ──
+            if (ambient === "rain") {
+                // Gentle vertical rain streaks — no glyphs, just green lines
+                // Each column falls at its own speed; the head is brighter than
+                // the tail. Two batched strokes keep this cheap per frame.
+                const colW = IS_MOBILE ? 10 : 12;
+                const cols = Math.floor(W / colW);
+                const rainVol = vol * 0.7 + 0.28;
+
+                // Dim tails
+                ctx.lineWidth = 1;
+                ctx.strokeStyle = `rgba(51, 255, 51, ${0.28 * rainVol})`;
+                ctx.beginPath();
+                for (let c = 0; c < cols; c++) {
+                    const speed = 90 + ((c * 53) % 110);          // 90..200 px/s
+                    const len   = 14 + ((c * 17) % 18);           // 14..32 px tall
+                    const phase = (c * 37) % 137;
+                    const y     = ((t * speed + phase * 5) % (H + len + 30)) - len - 15;
+                    const x     = c * colW + 3 + ((c * 11) % 4);
+                    ctx.moveTo(x, y);
+                    ctx.lineTo(x, y + len - 4);
+                }
+                ctx.stroke();
+
+                // Bright heads
+                ctx.lineWidth = 1.2;
+                ctx.strokeStyle = `rgba(180, 255, 190, ${0.72 * rainVol})`;
+                ctx.beginPath();
+                for (let c = 0; c < cols; c++) {
+                    const speed = 90 + ((c * 53) % 110);
+                    const len   = 14 + ((c * 17) % 18);
+                    const phase = (c * 37) % 137;
+                    const y     = ((t * speed + phase * 5) % (H + len + 30)) - len - 15;
+                    const x     = c * colW + 3 + ((c * 11) % 4);
+                    ctx.moveTo(x, y + len - 4);
+                    ctx.lineTo(x, y + len);
+                }
+                ctx.stroke();
+            }
+
+            // Ocean is now rendered directly in the particle field above —
+            // no post-processing overlay needed.
+
+            // ── Isochronic: multi-center pulses crashing into each other ──
+            // Replaces the old single center flash. Uses the four drifting
+            // source points so wavefronts emerge from different places each
+            // beat and collide mid-screen. 'lighter' compositing brightens
+            // overlap regions — visible interference without going RGB.
+            if (mode === "isochronic" || mode === "both") {
+                const period    = 1 / emissionHz;              // seconds per beat
+                const beatPhase = (t % period) / period;       // 0..1
+                const maxR      = Math.min(W, H) * 0.48;
+                const sources   = [
+                    [isoS0x, isoS0y],
+                    [isoS1x, isoS1y],
+                    [isoS2x, isoS2y],
+                    [isoS3x, isoS3y],
+                ];
+                const driveVol  = playing ? vol + 0.15 : 0.25;
+
+                ctx.save();
+                ctx.globalCompositeOperation = "lighter";
+
+                // Expanding rings — two staggered per source so there's always
+                // a fresh front and a trailing one, guaranteeing collisions.
+                ctx.lineWidth = 1.5;
+                for (let ring = 0; ring < 2; ring++) {
+                    const phase = (beatPhase + ring * 0.5) % 1;
+                    if (phase > 0.72) continue;                // fade tail
+                    const r = phase * maxR;
+                    const strokeA = (1 - phase / 0.72) * 0.38 * driveVol;
+                    if (strokeA < 0.02) continue;
+                    ctx.strokeStyle = `rgba(51, 255, 51, ${strokeA})`;
+                    for (let s = 0; s < sources.length; s++) {
+                        const sx = sources[s][0], sy = sources[s][1];
+                        ctx.beginPath();
+                        ctx.arc(sx, sy, r, 0, Math.PI * 2);
+                        ctx.stroke();
+                    }
+                }
+
+                // Nucleus flash — sharp bright pulse at each source on downbeat
+                if (beatPhase < 0.16 && playing) {
+                    const flashStr = (1 - beatPhase / 0.16) * 0.38 * (vol + 0.15);
+                    const rad = Math.min(W, H) * 0.22;
+                    for (let s = 0; s < sources.length; s++) {
+                        const sx = sources[s][0], sy = sources[s][1];
+                        const gr = ctx.createRadialGradient(sx, sy, 0, sx, sy, rad);
+                        gr.addColorStop(0,   `rgba(190, 255, 195, ${flashStr})`);
+                        gr.addColorStop(0.4, `rgba(51, 255, 51, ${flashStr * 0.45})`);
+                        gr.addColorStop(1,   "rgba(51, 255, 51, 0)");
+                        ctx.fillStyle = gr;
+                        ctx.fillRect(sx - rad, sy - rad, rad * 2, rad * 2);
+                    }
+                }
+
+                ctx.restore();
             }
         };
 
@@ -15250,6 +15568,7 @@ function Terminal() {
     const [volume, setVolume] = (0, _react.useState)(30);
     const [mode, setMode] = (0, _react.useState)("binaural");
     const [ambient, setAmbient] = (0, _react.useState)("none");
+    const [omOn, setOmOn] = (0, _react.useState)(false);
     const [view, setView] = (0, _react.useState)("main");
     const [activeName, setActiveName] = (0, _react.useState)("");
     // Preload real audio files in background on mount
@@ -15269,6 +15588,7 @@ function Terminal() {
         else {
             e.start(b, c, mode, volume / 100);
             e.setAmbient(ambient);
+            e.setOm(omOn);
         }
         setBeat(b);
         setCarrier(c);
@@ -15276,7 +15596,8 @@ function Terminal() {
     }, [
         mode,
         volume,
-        ambient
+        ambient,
+        omOn
     ]);
     const stopAudio = (0, _react.useCallback)(()=>{
         eng.current.stop();
@@ -15294,6 +15615,7 @@ function Terminal() {
         const p0 = preset.phases[0];
         eng.current.start(p0.beat, p0.carrier, mode, volume / 100);
         eng.current.setAmbient(ambient);
+        eng.current.setOm(omOn);
         setBeat(p0.beat);
         setCarrier(p0.carrier);
         setPlaying(true);
@@ -15703,6 +16025,7 @@ function Terminal() {
                                                     eng.current.stop();
                                                     eng.current.start(beat, carrier, m, volume / 100);
                                                     eng.current.setAmbient(ambient);
+                                                    eng.current.setOm(omOn);
                                                 }
                                             }
                                         }, m))
@@ -15732,6 +16055,27 @@ function Terminal() {
                                                 eng.current.setAmbient(a);
                                             }
                                         }, a))
+                                ]
+                            }),
+                            /*#__PURE__*/ (0, _jsxRuntime.jsxs)("div", {
+                                className: "flex items-center gap-1",
+                                children: [
+                                    /*#__PURE__*/ (0, _jsxRuntime.jsx)("span", {
+                                        style: {
+                                            color: "#33ff3360",
+                                            fontSize: "13px"
+                                        },
+                                        children: "OM:"
+                                    }),
+                                    /*#__PURE__*/ (0, _jsxRuntime.jsx)(Btn, {
+                                        label: omOn ? "ON" : "OFF",
+                                        active: omOn,
+                                        onClick: ()=>{
+                                            const next = !omOn;
+                                            setOmOn(next);
+                                            eng.current.setOm(next);
+                                        }
+                                    })
                                 ]
                             })
                         ]
